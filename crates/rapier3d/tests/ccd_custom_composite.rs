@@ -11,7 +11,7 @@ use rapier3d::parry::partitioning::Bvh;
 use rapier3d::parry::query::details::NormalConstraints;
 use rapier3d::parry::query::{PointProjection, PointQuery, Ray, RayCast, RayIntersection};
 use rapier3d::parry::shape::{
-    CompositeShape, Compound, Cylinder, FeatureId, Shape, ShapeType, TriMesh, TriMeshFlags,
+    CompositeShape, Compound, Cuboid, Cylinder, FeatureId, Shape, ShapeType, TriMesh, TriMeshFlags,
     TypedShape,
 };
 use rapier3d::prelude::*;
@@ -260,6 +260,94 @@ fn custom_composite_impact_matches_trimesh() {
     }
 }
 
+/// Steps a gravity-free world holding one fixed `target` collider and a fast 2 cm cube, and
+/// returns the cube's translation after each step.
+fn cube_trajectory(
+    target: ColliderBuilder,
+    start: Vector,
+    linvel: Vector,
+    steps: usize,
+) -> Vec<Vector> {
+    let mut h = Harness::new(Vector::ZERO);
+    h.colliders.insert(target);
+    let cube = h.insert_small_cube(start, linvel);
+    (0..steps)
+        .map(|_| {
+            h.step();
+            h.translation(cube)
+        })
+        .collect()
+}
+
+fn assert_same_trajectory(expected: &[Vector], custom: &[Vector], what: &str) {
+    for (step, (a, b)) in expected.iter().zip(custom).enumerate() {
+        assert!(
+            (*a - *b).length() < 1.0e-5,
+            "step {step}: custom composite {b:?} vs {what} {a:?}"
+        );
+    }
+}
+
+/// A moved and rotated custom composite floor sweeps like the `TriMesh` at the same pose: the
+/// parts are culled in the target's local frame and swept at the target's pose.
+#[test]
+fn posed_custom_floor_impact_matches_posed_trimesh() {
+    let pose = Pose::new(Vector::new(1.3, -2.0, 0.7), Vector::new(0.25, 0.4, -0.15));
+    let start = pose.transform_point(Vector::new(0.3, 1.0, -0.2));
+    let linvel = pose.rotation * Vector::new(3.0, -40.0, 2.0);
+    let floor = |shape: SharedShape| ColliderBuilder::new(shape).position(pose);
+    let trimesh = cube_trajectory(
+        floor(SharedShape::new(grid_floor(10.0, 16))),
+        start,
+        linvel,
+        2,
+    );
+    let custom = cube_trajectory(
+        floor(SharedShape::new(Custom(grid_floor(10.0, 16)))),
+        start,
+        linvel,
+        2,
+    );
+    let local_y = pose.inverse_transform_point(trimesh[1]).y;
+    assert!(
+        local_y > 0.0 && local_y < 0.1,
+        "the second step should end on the posed floor (local y = {local_y})"
+    );
+    assert_same_trajectory(&trimesh, &custom, "trimesh");
+}
+
+/// Parts with their own poses (a `Compound`'s children) under a moved and rotated custom
+/// composite sweep like the same `Compound`: each part's pose is composed after the target's.
+#[test]
+fn posed_custom_parts_impact_matches_compound() {
+    let part_pose = Pose::new(Vector::new(2.0, 0.5, 0.0), Vector::new(0.0, 0.0, 0.3));
+    let parts = || {
+        Compound::new(vec![
+            (
+                part_pose,
+                SharedShape::new(Cuboid::new(Vector::new(1.5, 0.2, 1.5))),
+            ),
+            (
+                Pose::new(Vector::new(-2.0, -0.5, 1.0), Vector::new(0.2, 0.0, 0.0)),
+                SharedShape::new(Cuboid::new(Vector::new(1.5, 0.2, 1.5))),
+            ),
+        ])
+    };
+    let pose = Pose::new(Vector::new(-0.4, 1.0, 0.3), Vector::new(0.1, -0.5, 0.2));
+    let world_part = pose * part_pose;
+    let start = world_part.transform_point(Vector::new(0.1, 1.2, -0.1));
+    let linvel = world_part.rotation * Vector::new(0.5, -40.0, 0.3);
+    let target = |shape: SharedShape| ColliderBuilder::new(shape).position(pose);
+    let compound = cube_trajectory(target(SharedShape::new(parts())), start, linvel, 2);
+    let custom = cube_trajectory(target(SharedShape::new(Custom(parts()))), start, linvel, 2);
+    let local_y = world_part.inverse_transform_point(compound[1]).y;
+    assert!(
+        local_y > 0.2 && local_y < 0.3,
+        "the second step should end on the posed part (local y = {local_y})"
+    );
+    assert_same_trajectory(&compound, &custom, "compound");
+}
+
 /// A fast small cube does not tunnel through a custom composite floor, and settles on it.
 #[test]
 fn fast_cube_does_not_tunnel_custom_floor() {
@@ -405,6 +493,41 @@ fn custom_composite_without_proxy_parts_falls_back() {
         assert!(
             y > 0.0,
             "cube tunneled through the disk at step {i} (y = {y})"
+        );
+    }
+}
+
+/// A part with no point-cloud proxy sends the whole collider to the nonlinear cast even when a
+/// supported part was already hit: a fast cube lands on a cuboid plate (top at y = 0) that has a
+/// cylinder part under it, inside the cube's swept box. The nonlinear cast stops the cube
+/// touching the plate; the proxy sweep would stop it `linear_slop` above. The plate and the
+/// cylinder swap sides between the two runs, so one of them reaches the plate's part first.
+#[test]
+fn unsupported_part_after_a_supported_hit_still_falls_back() {
+    let slop = IntegrationParameters::default().allowed_linear_error();
+    for plate_x in [-0.5, 0.5] {
+        let target = Compound::new(vec![
+            (
+                Pose::from_translation(Vector::new(plate_x, -0.05, 0.0)),
+                SharedShape::new(Cuboid::new(Vector::new(2.0, 0.05, 2.0))),
+            ),
+            (
+                Pose::from_translation(Vector::new(-plate_x, -0.2, 0.0)),
+                SharedShape::new(Cylinder::new(0.05, 1.0)),
+            ),
+        ]);
+        let path = cube_trajectory(
+            ColliderBuilder::new(SharedShape::new(Custom(target))),
+            Vector::new(0.0, 1.0, 0.0),
+            Vector::new(0.0, -40.0, 0.0),
+            2,
+        );
+        // The cube's half-extent is 1 cm.
+        let gap = path[1].y - 0.01;
+        assert!(
+            gap.abs() < 0.25 * slop,
+            "plate at x = {plate_x}: the cube stopped {gap} above the plate, not touching it \
+             (the proxy sweep stops at {slop})"
         );
     }
 }
