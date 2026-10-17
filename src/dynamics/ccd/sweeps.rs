@@ -1,6 +1,9 @@
 //! Sweep machinery of the continuous-collision pass: fast-collider descriptions,
 //! per-pair time-of-impact casts (proxy sweeps + nonlinear fallback),
 //! and the per-body continuous solve.
+//!
+//! Modified in the dezverev/rapier fork (from v0.36.0): custom composite shapes are swept part
+//! by part, culled by the swept box, instead of by one nonlinear cast over the whole shape.
 
 use crate::alloc_prelude::*;
 use crate::dynamics::{RigidBody, RigidBodyHandle, RigidBodySet, SoftBodySet};
