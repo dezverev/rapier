@@ -13,11 +13,11 @@ use crate::pipeline::{ActiveHooks, PairFilterContext, PhysicsHooks};
 #[cfg(feature = "dim2")]
 use parry::query::sweep_toi::CORE_FRACTION;
 use parry::query::sweep_toi::{
-    Sweep, SweepCompositeFastShape, SweepToiStatus, ToiProxy, sweep_time_of_impact,
+    Sweep, SweepCompositeFastShape, SweepToiOutput, SweepToiStatus, ToiProxy, sweep_time_of_impact,
     sweep_time_of_impact_composite,
 };
 use parry::query::{NonlinearRigidMotion, QueryDispatcher};
-use parry::shape::{Shape, TypedShape};
+use parry::shape::{CompositeShape, Shape, TypedShape};
 
 /// Is `rb` a *fixed* CCD target? A parentless collider (`rb == None`) and a
 /// `Fixed` parent body are both fixed. Kinematic and dynamic parents are not.
@@ -90,6 +90,15 @@ fn is_composite_shape(shape: &dyn Shape) -> bool {
             | TypedShape::HeightField(_)
             | TypedShape::Compound(_)
     )
+}
+
+/// The parts of a custom composite shape: a [`TypedShape::Custom`] exposing
+/// [`Shape::as_composite_shape`], which [`sweep_time_of_impact_composite`] doesn't handle.
+fn custom_composite_shape(shape: &dyn Shape) -> Option<&(dyn CompositeShape + Sync)> {
+    match shape.as_typed_shape() {
+        TypedShape::Custom(_) => shape.as_composite_shape(),
+        _ => None,
+    }
 }
 
 /// Is this a shape the continuous phase never sweeps as the *fast* (moving) shape?
@@ -295,7 +304,14 @@ enum TargetKind<'a> {
     Proxy(ToiProxy<'a>),
     /// Composite target handled by [`sweep_time_of_impact_composite`].
     Composite,
+    /// Custom composite target (see [`custom_composite_shape`]) handled by
+    /// [`sweep_custom_composite`].
+    CustomComposite(&'a (dyn CompositeShape + Sync)),
 }
+
+/// A culled part of a custom composite target has no point-cloud proxy (a cylinder, a cone, a
+/// nested composite…): the pair falls back to the whole-collider nonlinear cast.
+struct UnsupportedPart;
 
 /// A hit against a sensor (or a pair with mismatched solver groups), recorded during the
 /// sweep for later intersection-event emission. Never clamps positions.
@@ -349,28 +365,33 @@ fn cast_collider_pair(
     let target = match ToiProxy::from_shape(shape2) {
         Some(proxy) => TargetKind::Proxy(proxy),
         None if is_composite_shape(shape2) => TargetKind::Composite,
-        // Targets with neither a point-cloud proxy nor a supported composite sweep
-        // (cylinders, cones, voxels, custom shapes): one whole-collider nonlinear cast.
-        None => {
-            return fallback_nonlinear_fraction(
-                dispatcher,
-                fast,
-                co2,
-                &target_pose,
-                max_fraction,
-                dt,
-                is_pseudo,
-            );
-        }
+        None => match custom_composite_shape(shape2) {
+            Some(composite) => TargetKind::CustomComposite(composite),
+            // Targets with neither a point-cloud proxy nor a supported composite sweep
+            // (cylinders, cones, voxels, non-composite custom shapes): one whole-collider
+            // nonlinear cast.
+            None => {
+                return fallback_nonlinear_fraction(
+                    dispatcher,
+                    fast,
+                    co2,
+                    &target_pose,
+                    max_fraction,
+                    dt,
+                    is_pseudo,
+                );
+            }
+        },
     };
 
     // Each accepted piece fraction tightens `max_fraction`, so the returned value is the
     // earliest impact across all the pieces (both the solid and pseudo accept conditions
     // only pass at or below the current bound).
+    let pair_max_fraction = max_fraction;
     let mut best = None;
     let mut max_fraction = max_fraction;
     for sub in sub_shapes {
-        if let Some(fraction) = cast_sub_shape(
+        match cast_sub_shape(
             sub,
             &target,
             shape2,
@@ -379,15 +400,30 @@ fn cast_collider_pair(
             linear_slop,
             is_pseudo,
         ) {
-            best = Some(fraction);
-            max_fraction = fraction;
+            Ok(Some(fraction)) => {
+                best = Some(fraction);
+                max_fraction = fraction;
+            }
+            Ok(None) => {}
+            Err(UnsupportedPart) => {
+                return fallback_nonlinear_fraction(
+                    dispatcher,
+                    fast,
+                    co2,
+                    &target_pose,
+                    pair_max_fraction,
+                    dt,
+                    is_pseudo,
+                );
+            }
         }
     }
     best
 }
 
 /// Casts one convex piece of the fast collider against the target collider's shape and
-/// returns the accepted impact fraction (see [`cast_collider_pair`]), or `None`.
+/// returns the accepted impact fraction (see [`cast_collider_pair`]), or `None`. Fails only
+/// on a custom composite target with an [`UnsupportedPart`].
 fn cast_sub_shape(
     sub: &FastSubShape,
     target: &TargetKind,
@@ -396,7 +432,7 @@ fn cast_sub_shape(
     max_fraction: Real,
     linear_slop: Real,
     is_pseudo: bool,
-) -> Option<Real> {
+) -> Result<Option<Real>, UnsupportedPart> {
     let output = match target {
         TargetKind::Proxy(target_proxy) => {
             let target_sweep = Sweep::constant(target_pose, Vector::ZERO);
@@ -424,7 +460,7 @@ fn cast_sub_shape(
                 local_centroid: sub.local_centroid,
                 min_extent: sub.min_extent,
             };
-            sweep_time_of_impact_composite(
+            match sweep_time_of_impact_composite(
                 shape2,
                 target_pose,
                 fast_desc,
@@ -432,25 +468,31 @@ fn cast_sub_shape(
                 is_pseudo,
                 max_fraction,
                 linear_slop,
-            )?
+            ) {
+                Some(output) => output,
+                None => return Ok(None),
+            }
+        }
+        TargetKind::CustomComposite(composite) => {
+            sweep_custom_composite(*composite, target_pose, sub, max_fraction, linear_slop)?
         }
     };
 
     if is_pseudo {
         // Any genuine impact counts (initial overlaps are filtered later by the endpoint
         // intersection re-check); `Separated` does not.
-        return match output.status {
+        return Ok(match output.status {
             SweepToiStatus::Hit | SweepToiStatus::Failed | SweepToiStatus::Overlapped
                 if output.fraction <= max_fraction =>
             {
                 Some(output.fraction)
             }
             _ => None,
-        };
+        });
     }
 
     if 0.0 < output.fraction && output.fraction < max_fraction {
-        return Some(output.fraction);
+        return Ok(Some(output.fraction));
     }
 
     #[cfg(feature = "dim2")]
@@ -469,17 +511,101 @@ fn cast_sub_shape(
                 linear_slop,
             );
             if 0.0 < output.fraction && output.fraction < max_fraction {
-                return Some(output.fraction);
+                return Ok(Some(output.fraction));
             }
         }
     }
 
-    None
+    Ok(None)
+}
+
+/// [`sweep_time_of_impact_composite`] for a custom composite target (see
+/// [`custom_composite_shape`]), which would otherwise take the whole-collider nonlinear cast: a
+/// nonlinear bounding-ball cast per BVH node visited, far too slow on a large static scene.
+/// Mirrors parry's `TriMesh` path: the parts' BVH is culled with the piece's swept AABB, each
+/// culled part runs the convex TOI (triangles as their three points), the earliest hit tightens
+/// `max_fraction`, and an initial overlap retries with the mesh fallback ball around the
+/// piece's centroid.
+///
+/// Differences from that path: a custom composite has no orientation flag, so it is two-sided
+/// like an unoriented `TriMesh` (no one-sided early-outs, and `is_pseudo` has nothing to
+/// change); nested composite parts are not recursed into like a `Compound`'s children; and
+/// any culled part without a point-cloud proxy fails the whole pair over to the nonlinear cast
+/// ([`UnsupportedPart`]) instead of being skipped.
+fn sweep_custom_composite(
+    composite: &dyn CompositeShape,
+    composite_pose: &Pose,
+    sub: &FastSubShape,
+    max_fraction: Real,
+    linear_slop: Real,
+) -> Result<SweepToiOutput, UnsupportedPart> {
+    // The mesh fallback ball of `sweep_time_of_impact_composite`.
+    #[cfg(feature = "dim2")]
+    let fallback_radius = CORE_FRACTION * sub.min_extent;
+    #[cfg(feature = "dim3")]
+    let fallback_radius = (0.5 * sub.min_extent).max(linear_slop) + linear_slop;
+    let fallback_proxy = ToiProxy::point(sub.local_centroid, fallback_radius);
+
+    // Swept bounds of the piece, in the composite's local frame.
+    let start_aabb = sub.proxy.compute_aabb(&sub.sweep.transform_at(0.0));
+    let end_aabb = sub
+        .proxy
+        .compute_aabb(&sub.sweep.transform_at(max_fraction));
+    let local_aabb = start_aabb
+        .merged(&end_aabb)
+        .transform_by(&composite_pose.inverse());
+
+    let mut max_fraction = max_fraction;
+    let mut best = None;
+    let mut unsupported = false;
+    for part_id in composite.bvh().intersect_aabb(&local_aabb) {
+        composite.map_part_at(part_id, &mut |part_pose, part, _| {
+            let Some(part_proxy) = ToiProxy::from_shape(part) else {
+                unsupported = true;
+                return;
+            };
+            let part_pose = part_pose.map_or(*composite_pose, |p| *composite_pose * *p);
+            let part_sweep = Sweep::constant(&part_pose, Vector::ZERO);
+            let mut output = sweep_time_of_impact(
+                &part_proxy,
+                &part_sweep,
+                &sub.proxy,
+                &sub.sweep,
+                max_fraction,
+                linear_slop,
+            );
+            if output.fraction == 0.0 {
+                output = sweep_time_of_impact(
+                    &part_proxy,
+                    &part_sweep,
+                    &fallback_proxy,
+                    &sub.sweep,
+                    max_fraction,
+                    linear_slop,
+                );
+            }
+            if 0.0 < output.fraction && output.fraction < max_fraction {
+                max_fraction = output.fraction;
+                best = Some(output);
+            }
+        });
+        if unsupported {
+            return Err(UnsupportedPart);
+        }
+    }
+
+    Ok(best.unwrap_or(SweepToiOutput {
+        status: SweepToiStatus::Separated,
+        fraction: max_fraction,
+        point: Vector::ZERO,
+        normal: Vector::ZERO,
+    }))
 }
 
 /// Nonlinear shape-cast fallback for pairs the proxy sweep can't handle (cylinder, cone or
-/// custom fast shapes; cylinder, cone, voxels or custom targets). Motion is derived from
-/// the solved effective velocities, like rapier's historical CCD.
+/// custom fast shapes; cylinder, cone, voxels or custom targets — custom composites only with
+/// an [`UnsupportedPart`]). Motion is derived from the solved effective velocities, like
+/// rapier's historical CCD.
 fn fallback_nonlinear_fraction(
     dispatcher: &dyn QueryDispatcher,
     fast: &FastColliderInfo,
